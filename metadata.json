@@ -1,0 +1,8 @@
+{
+  "name": "Copy of Gemini Screen Intelligence",
+  "description": "A high-end React application that allows you to share your screen and interact with Gemini Live. The AI can see your screen in real-time and talk back to you.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
