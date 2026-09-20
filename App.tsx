@@ -1,12 +1,10 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
 import { ConnectionStatus, Message } from './types';
 import { decode, encode, decodeAudioData, createPcmBlob } from './services/audioUtils';
 
 // --- Constants ---
-const MODEL_NAME = 'gemini-2.5-flash-native-audio-preview-09-2025';
-const FRAME_RATE = 1; // 1 frame per second for vision input
+const FRAME_RATE = 0.5; // 1 frame every 2 seconds to reduce API load and speed up responses
 const JPEG_QUALITY = 0.6;
 
 const App: React.FC = () => {
@@ -15,6 +13,11 @@ const App: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [inputText, setInputText] = useState('');
+  const [micVolume, setMicVolume] = useState(0);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  const [selectedLanguage, setSelectedLanguage] = useState<string>('English');
 
   // --- Refs for Resources ---
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -29,6 +32,29 @@ const App: React.FC = () => {
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  
+  // VAD Refs
+  const isSpeakingRef = useRef<boolean>(false);
+  const silenceStartRef = useRef<number | null>(null);
+
+  // --- Initialize Devices ---
+  useEffect(() => {
+    const getDevices = async () => {
+      try {
+        // Request initial permission to get device labels
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter(device => device.kind === 'audioinput');
+        setAudioDevices(audioInputs);
+        if (audioInputs.length > 0) {
+          setSelectedDeviceId(audioInputs[0].deviceId);
+        }
+      } catch (err) {
+        console.error('Error getting devices:', err);
+      }
+    };
+    getDevices();
+  }, []);
 
   // --- Helpers ---
   const addMessage = (role: 'user' | 'model', text: string) => {
@@ -74,8 +100,27 @@ const App: React.FC = () => {
       setError(null);
       setStatus(ConnectionStatus.CONNECTING);
 
-      // 1. Get User Media (Mic)
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Create and resume AudioContexts immediately in the user gesture!
+      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      inputAudioCtxRef.current = inputCtx;
+      outputAudioCtxRef.current = outputCtx;
+      if (inputCtx.state === 'suspended') inputCtx.resume();
+      if (outputCtx.state === 'suspended') outputCtx.resume();
+
+      // 1. Get User Media (Mic) with full echo cancellation and specific device
+      const audioConstraints: any = {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+      };
+      if (selectedDeviceId) {
+          audioConstraints.deviceId = { exact: selectedDeviceId };
+      }
+      
+      const micStream = await navigator.mediaDevices.getUserMedia({ 
+          audio: audioConstraints
+      });
       micStreamRef.current = micStream;
 
       // 2. Get Screen Stream
@@ -86,45 +131,73 @@ const App: React.FC = () => {
       streamRef.current = screenStream;
       setIsScreenSharing(true);
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = screenStream;
-      }
+      // We need to wait for the next render for videoRef.current to be populated.
+      setTimeout(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = screenStream;
+          videoRef.current.play().catch(e => console.error('Video play error:', e));
+        }
+      }, 100);
 
-      // 3. Setup Audio Contexts
-      inputAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      outputAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      const outputNode = outputAudioCtxRef.current.createGain();
-      outputNode.connect(outputAudioCtxRef.current.destination);
+      const outputNode = outputAudioCtxRef.current!.createGain();
+      outputNode.connect(outputAudioCtxRef.current!.destination);
 
-      // 4. Connect to Gemini Live API
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      
-      const sessionPromise = ai.live.connect({
-        model: MODEL_NAME,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
-          },
-          systemInstruction: "You are a screen sharing assistant. You can see the user's screen through periodic snapshots. Assist the user with whatever is on their screen. Be concise and conversational.",
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-        },
-        callbacks: {
-          onopen: () => {
-            console.log('Gemini Live session opened');
+      // 4. Connect to Backend Relay
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsHost = import.meta.env.PROD ? window.location.host : 'localhost:8080';
+      const wsUrl = `${wsProtocol}//${wsHost}?lang=${encodeURIComponent(selectedLanguage)}`;
+      const ws = new WebSocket(wsUrl);
+      sessionRef.current = ws;
+
+      ws.onopen = () => {
+        console.log('WebSocket relay connected');
+      };
+
+      ws.onmessage = async (event) => {
+        const message = JSON.parse(event.data);
+        
+        if (message.type === 'connected') {
             setStatus(ConnectionStatus.CONNECTED);
             
             // Start streaming mic audio
             if (inputAudioCtxRef.current) {
+              if (inputAudioCtxRef.current.state === 'suspended') {
+                  inputAudioCtxRef.current.resume();
+              }
               const source = inputAudioCtxRef.current.createMediaStreamSource(micStream);
-              const scriptProcessor = inputAudioCtxRef.current.createScriptProcessor(4096, 1, 1);
+              const scriptProcessor = inputAudioCtxRef.current.createScriptProcessor(2048, 1, 1);
               scriptProcessor.onaudioprocess = (e) => {
                 const inputData = e.inputBuffer.getChannelData(0);
+                
+                // Calculate volume for UI
+                let sum = 0;
+                for (let i = 0; i < inputData.length; i++) {
+                    sum += Math.abs(inputData[i]);
+                }
+                const volume = sum / inputData.length;
+                setMicVolume(volume);
+
+                // Aggressive Client-Side VAD (Voice Activity Detection)
+                if (volume > 0.01) {
+                    silenceStartRef.current = null;
+                    isSpeakingRef.current = true;
+                } else if (isSpeakingRef.current) {
+                    if (silenceStartRef.current === null) {
+                        silenceStartRef.current = Date.now();
+                    } else if (Date.now() - silenceStartRef.current > 800) {
+                        // 800ms of silence detected! End turn immediately to bypass AI delay.
+                        isSpeakingRef.current = false;
+                        silenceStartRef.current = null;
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ type: 'end_of_turn' }));
+                        }
+                    }
+                }
+
                 const pcmBlob = createPcmBlob(inputData);
-                sessionPromise.then(session => {
-                  session.sendRealtimeInput({ media: pcmBlob });
-                });
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ media: pcmBlob }));
+                }
               };
               source.connect(scriptProcessor);
               scriptProcessor.connect(inputAudioCtxRef.current.destination);
@@ -132,24 +205,24 @@ const App: React.FC = () => {
 
             // Start streaming screen frames
             frameIntervalRef.current = window.setInterval(() => {
-              if (videoRef.current && canvasRef.current && sessionRef.current) {
+              if (videoRef.current && canvasRef.current && ws.readyState === WebSocket.OPEN) {
                 const video = videoRef.current;
                 const canvas = canvasRef.current;
                 const ctx = canvas.getContext('2d');
                 if (ctx) {
-                  canvas.width = video.videoWidth;
-                  canvas.height = video.videoHeight;
-                  ctx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+                  const MAX_WIDTH = 854; // 480p width
+                  const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
+                  canvas.width = video.videoWidth * scale;
+                  canvas.height = video.videoHeight * scale;
+                  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                   canvas.toBlob(async (blob) => {
                     if (blob) {
                       const reader = new FileReader();
                       reader.onloadend = () => {
                         const base64Data = (reader.result as string).split(',')[1];
-                        sessionPromise.then(session => {
-                          session.sendRealtimeInput({
-                            media: { data: base64Data, mimeType: 'image/jpeg' }
-                          });
-                        });
+                        ws.send(JSON.stringify({
+                          media: { data: base64Data, mimeType: 'image/jpeg' }
+                        }));
                       };
                       reader.readAsDataURL(blob);
                     }
@@ -157,23 +230,35 @@ const App: React.FC = () => {
                 }
               }
             }, 1000 / FRAME_RATE);
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            // Handle Audio Transcription for History
-            if (message.serverContent?.inputTranscription) {
-               // Optional: Show live transcriptions
-            }
-            if (message.serverContent?.outputTranscription) {
-               // Optional: Show live model responses
-            }
-            if (message.serverContent?.turnComplete) {
-              // End of a turn
-            }
+            return;
+        }
 
-            // Handle Audio Playback
-            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio && outputAudioCtxRef.current) {
+        if (message.error) {
+            console.error('Relay error:', message.error);
+            setError(message.error);
+            cleanup();
+            return;
+        }
+
+        // Handle Server Content (Audio & Text)
+        const parts = message.serverContent?.modelTurn?.parts;
+        if (parts) {
+          // Extract Text
+          const textPart = parts.find((p: any) => p.text);
+          if (textPart && textPart.text) {
+            addMessage('model', textPart.text);
+          }
+
+          // Extract Audio
+          const audioPart = parts.find((p: any) => p.inlineData && p.inlineData.mimeType?.startsWith('audio'));
+          const base64Audio = audioPart?.inlineData?.data;
+
+          if (base64Audio && outputAudioCtxRef.current) {
+            try {
               const ctx = outputAudioCtxRef.current;
+              if (ctx.state === 'suspended') {
+                  ctx.resume();
+              }
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
               
               const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
@@ -188,30 +273,33 @@ const App: React.FC = () => {
               source.start(nextStartTimeRef.current);
               nextStartTimeRef.current += audioBuffer.duration;
               audioSourcesRef.current.add(source);
+            } catch (audioErr) {
+              console.error('Audio playback error:', audioErr);
             }
-
-            // Handle Interruptions
-            if (message.serverContent?.interrupted) {
-              audioSourcesRef.current.forEach(s => {
-                try { s.stop(); } catch (e) {}
-              });
-              audioSourcesRef.current.clear();
-              nextStartTimeRef.current = 0;
-            }
-          },
-          onerror: (e) => {
-            console.error('Gemini Live error:', e);
-            setError('An error occurred with the AI session.');
-            cleanup();
-          },
-          onclose: () => {
-            console.log('Gemini Live session closed');
-            cleanup();
           }
         }
-      });
 
-      sessionRef.current = await sessionPromise;
+        // Handle Interruptions: Stop current audio and reset timing so new responses play immediately
+        if (message.serverContent?.interrupted) {
+          console.log('Gemini interrupted by user audio');
+          audioSourcesRef.current.forEach(source => {
+            try { source.stop(); } catch (e) {}
+          });
+          audioSourcesRef.current.clear();
+          nextStartTimeRef.current = 0;
+        }
+      };
+
+      ws.onerror = (e) => {
+        console.error('WebSocket error:', e);
+        setError('An error occurred with the relay connection.');
+        cleanup();
+      };
+
+      ws.onclose = () => {
+        console.log('WebSocket closed');
+        cleanup();
+      };
 
       // Handle screen sharing stop (from browser UI)
       screenStream.getVideoTracks()[0].onended = () => {
@@ -228,6 +316,26 @@ const App: React.FC = () => {
   useEffect(() => {
     return () => cleanup();
   }, [cleanup]);
+
+  const sendTextMessage = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputText.trim() || status !== ConnectionStatus.CONNECTED || !sessionRef.current) return;
+    
+    // Add to UI
+    addMessage('user', inputText);
+    
+    // Send to backend
+    if (sessionRef.current.readyState === WebSocket.OPEN) {
+      sessionRef.current.send(JSON.stringify({
+        clientContent: {
+          turns: [{ role: 'user', parts: [{ text: inputText }] }],
+          turnComplete: true
+        }
+      }));
+    }
+    
+    setInputText('');
+  };
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-4 md:p-8 bg-slate-900 text-white">
@@ -325,18 +433,33 @@ const App: React.FC = () => {
           
           <div className="flex-1 p-6 space-y-6 overflow-y-auto">
             <div className="space-y-4">
-              <div className="flex space-x-3">
-                <div className="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-bold">1</div>
-                <p className="text-sm text-slate-300">Grant microphone and screen recording permissions.</p>
-              </div>
-              <div className="flex space-x-3">
-                <div className="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-bold">2</div>
-                <p className="text-sm text-slate-300">Talk naturally. Gemini is listening and watching your active screen.</p>
-              </div>
-              <div className="flex space-x-3">
-                <div className="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-bold">3</div>
-                <p className="text-sm text-slate-300">Try asking: "What's on my screen?", "Can you help me summarize this?", or "Explain this code."</p>
-              </div>
+              {messages.length === 0 ? (
+                <>
+                  <div className="flex space-x-3">
+                    <div className="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-bold">1</div>
+                    <p className="text-sm text-slate-300">Grant microphone and screen recording permissions.</p>
+                  </div>
+                  <div className="flex space-x-3">
+                    <div className="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-bold">2</div>
+                    <p className="text-sm text-slate-300">Talk naturally. Gemini is listening and watching your active screen.</p>
+                  </div>
+                  <div className="flex space-x-3">
+                    <div className="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-bold">3</div>
+                    <p className="text-sm text-slate-300">Try asking: "What's on my screen?", "Can you help me summarize this?", or "Explain this code."</p>
+                  </div>
+                </>
+              ) : (
+                <div className="flex flex-col space-y-4">
+                  {messages.map((msg, i) => (
+                    <div key={i} className={`p-3 rounded-lg text-sm ${msg.role === 'model' ? 'bg-indigo-900/40 text-indigo-100 border border-indigo-500/30' : 'bg-slate-800 text-slate-300 border border-slate-700'}`}>
+                      <div className="font-bold mb-1 text-xs uppercase tracking-wider opacity-70">
+                        {msg.role === 'model' ? 'Gemini' : 'You'}
+                      </div>
+                      <div className="whitespace-pre-wrap">{msg.text}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {error && (
@@ -348,15 +471,92 @@ const App: React.FC = () => {
               </div>
             )}
 
+            {/* Microphone & Language Selectors */}
+            {status !== ConnectionStatus.CONNECTED && (
+                <div className="space-y-4">
+                    {audioDevices.length > 0 && (
+                        <div className="space-y-2">
+                            <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Select Microphone</label>
+                            <select 
+                                value={selectedDeviceId}
+                                onChange={(e) => setSelectedDeviceId(e.target.value)}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500"
+                            >
+                                {audioDevices.map((device, idx) => (
+                                    <option key={device.deviceId} value={device.deviceId}>
+                                        {device.label || `Microphone ${idx + 1}`}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                    )}
+                    
+                    <div className="space-y-2">
+                        <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Language</label>
+                        <select 
+                            value={selectedLanguage}
+                            onChange={(e) => setSelectedLanguage(e.target.value)}
+                            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500"
+                        >
+                            <option value="English">English</option>
+                            <option value="Spanish">Spanish</option>
+                            <option value="French">French</option>
+                            <option value="German">German</option>
+                            <option value="Hindi">Hindi</option>
+                            <option value="Japanese">Japanese</option>
+                            <option value="Mandarin">Mandarin</option>
+                            <option value="Korean">Korean</option>
+                            <option value="Arabic">Arabic</option>
+                            <option value="Portuguese">Portuguese</option>
+                            <option value="Russian">Russian</option>
+                            <option value="Italian">Italian</option>
+                        </select>
+                    </div>
+                </div>
+            )}
+
             {status === ConnectionStatus.CONNECTED && (
-               <div className="p-4 bg-indigo-600/10 border border-indigo-500/30 rounded-xl space-y-2">
+               <div className="p-4 bg-indigo-600/10 border border-indigo-500/30 rounded-xl space-y-4">
                   <div className="flex items-center space-x-2">
                     <div className="w-2 h-2 rounded-full bg-indigo-500 animate-ping" />
                     <span className="text-xs font-bold text-indigo-300 uppercase">Live Session Active</span>
                   </div>
                   <p className="text-xs text-slate-400">Gemini is processing your screen data and audio in real-time.</p>
+                  
+                  {/* Mic Volume Indicator */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] text-slate-400 font-medium">
+                      <span>MIC VOLUME</span>
+                      <span>{micVolume > 0.01 ? 'DETECTING VOICE' : 'SILENT'}</span>
+                    </div>
+                    <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                      <div 
+                        className="bg-green-500 h-1.5 transition-all duration-75" 
+                        style={{ width: `${Math.min(100, micVolume * 500)}%` }} 
+                      />
+                    </div>
+                  </div>
                </div>
             )}
+            
+            {/* Chat Input */}
+            <form onSubmit={sendTextMessage} className="mt-4 flex gap-2">
+              <input
+                type="text"
+                value={inputText}
+                onChange={(e) => setInputText(e.target.value)}
+                placeholder="Type a message..."
+                disabled={status !== ConnectionStatus.CONNECTED}
+                className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500 disabled:opacity-50"
+              />
+              <button 
+                type="submit"
+                disabled={status !== ConnectionStatus.CONNECTED || !inputText.trim()}
+                className="bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-700 px-4 py-2 rounded-lg text-sm font-semibold transition-colors disabled:opacity-50"
+              >
+                Send
+              </button>
+            </form>
           </div>
 
           <div className="p-4 bg-slate-900/50 border-t border-slate-700 text-[10px] text-slate-500 text-center uppercase tracking-widest font-bold">

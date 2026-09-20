@@ -40,8 +40,18 @@ export async function decodeAudioData(
 export function createPcmBlob(data: Float32Array): { data: string; mimeType: string } {
   const l = data.length;
   const int16 = new Int16Array(l);
+  const GAIN = 2.0; // Boost audio by 2x for better voice detection
+  const NOISE_GATE = 0.03; // Stronger noise gate to force silence and trigger fast VAD
+  
   for (let i = 0; i < l; i++) {
-    int16[i] = data[i] * 32768;
+    let val = data[i];
+    if (Math.abs(val) < NOISE_GATE) {
+      val = 0; // Cut off background noise
+    } else {
+      val = val * GAIN;
+    }
+    const s = Math.max(-1, Math.min(1, val));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
   }
   return {
     data: encode(new Uint8Array(int16.buffer)),
